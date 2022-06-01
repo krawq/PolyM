@@ -1,5 +1,5 @@
 #include "polym/Queue.hpp"
-
+#include "polym/circular_q.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <queue>
@@ -11,17 +11,10 @@ namespace PolyM {
 
 class Queue::Impl
 {
-    struct Request
-    {
-        Request() {};
-        
-        std::unique_ptr<Msg> response;
-        std::condition_variable condVar;
-    };
 
 public:
     Impl()
-      : queue_(), queueMutex_(), queueCond_(), responseMap_(), responseMapMutex_()
+      : queue_(), queueMutex_(), push_cv_(), responseMap_(), responseMapMutex_()
     {
     }
 
@@ -32,7 +25,7 @@ public:
             queue_.push(msg.move());
         }
 
-        queueCond_.notify_one();
+        push_cv_.notify_one();
     }
 
     std::unique_ptr<Msg> get(int timeoutMillis)
@@ -40,11 +33,11 @@ public:
         std::unique_lock<std::mutex> lock(queueMutex_);
 
         if (timeoutMillis <= 0)
-            queueCond_.wait(lock, [this]{return !queue_.empty();});
+            push_cv_.wait(lock, [this]{return !queue_.empty();});
         else
         {
             // wait_for returns false if the return is due to timeout
-            auto timeoutOccured = !queueCond_.wait_for(
+            auto timeoutOccured = !push_cv_.wait_for(
                 lock,
                 std::chrono::milliseconds(timeoutMillis),
                 [this]{return !queue_.empty();});
@@ -128,7 +121,7 @@ private:
     std::mutex queueMutex_;
 
     // Condition variable to wait for when getting Msgs from the queue
-    std::condition_variable queueCond_;
+    std::condition_variable push_cv_;
 
     // Map to keep track of which request IDs are associated with which request Msgs
     std::map<MsgUID, Request*> responseMap_;
@@ -169,6 +162,67 @@ std::unique_ptr<Msg> Queue::request(Msg&& msg, int timeoutMillis)
 bool Queue::respondTo(MsgUID reqUid, Msg&& responseMsg)
 {
     return impl_->respondTo(reqUid, std::move(responseMsg));
+}
+
+CircularQueue::CircularQueue(size_t max_items) : queue_(max_items)
+{
+}
+
+void CircularQueue::put(Msg&& msg)
+{
+    {
+        std::unique_lock<std::mutex> lock(queueMutex_);
+        pop_cv_.wait(lock, [this] { return !this->queue_.full(); });
+        queue_.push_back(msg.move());
+    }
+    push_cv_.notify_one();
+}
+
+std::unique_ptr<Msg> CircularQueue::get(int timeoutMillis)
+{
+    std::unique_ptr<Msg> msg = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(queueMutex_);
+
+        if (timeoutMillis <= 0)
+            push_cv_.wait(lock, [this] {return !queue_.empty(); });
+        else
+        {
+            // wait_for returns false if the return is due to timeout
+            auto timeoutOccured = !push_cv_.wait_for(
+                lock,
+                std::chrono::milliseconds(timeoutMillis),
+                [this] {return !queue_.empty(); });
+
+            if (timeoutOccured)
+                return msg;
+        }
+
+        msg = queue_.front()->move();
+        queue_.pop_front();
+    }
+    pop_cv_.notify_one();
+    return msg;
+}
+
+std::unique_ptr<Msg> CircularQueue::tryGet()
+{
+    return std::unique_ptr<Msg>();
+}
+
+std::unique_ptr<Msg> CircularQueue::request(Msg&& msg, int timeoutMillis)
+{
+    return std::unique_ptr<Msg>();
+}
+
+bool CircularQueue::respondTo(MsgUID reqUid, Msg&& responseMsg)
+{
+    return false;
+}
+
+std::unique_ptr<Msg> get(int timeoutMillis)
+{
+    return std::unique_ptr<Msg>();
 }
 
 }
